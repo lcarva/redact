@@ -135,7 +135,7 @@ func (o *Opt) Redact(s string) (string, error) {
 		pos := f.LineStart(finding.StartLine + 1)
 		// Convert 1-based column offset to 0-based string offset accounting for newline.
 		off := f.Offset(pos) + (finding.StartColumn - nl)
-		off += len(finding.Match) - len(finding.Secret)
+		off += strings.Index(finding.Match, finding.Secret)
 		s = s[:off] + o.overwrite.Replace(finding.Secret) + s[off+len(finding.Secret):]
 	}
 
