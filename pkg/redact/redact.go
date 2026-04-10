@@ -80,16 +80,9 @@ func (o *Opt) Err() error {
 }
 
 // Redact removes secrets detected in the provided string.
-// If the content is a JSON document (object or array), string values
-// are individually unescaped, scanned for secrets, and re-escaped
-// to preserve valid JSON output.
 func (o *Opt) Redact(s string) (string, error) {
 	if o.err != nil {
 		return "", o.err
-	}
-
-	if isJSON([]byte(s)) {
-		return o.redactJSON(s)
 	}
 
 	return o.detectAndReplace(s)
