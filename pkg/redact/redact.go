@@ -12,17 +12,17 @@ import (
 	"github.com/spf13/viper"
 	"github.com/zricethezav/gitleaks/v8/config"
 	"github.com/zricethezav/gitleaks/v8/detect"
-	"github.com/zricethezav/gitleaks/v8/report"
 	"go.iscode.ca/redact/pkg/redact/overwrite"
 )
 
 const ReplacementText = "**REDACTED**"
 
 type Opt struct {
-	rules     string
-	overwrite overwrite.Replacer
-	d         *detect.Detector
-	err       error
+	rules          string
+	overwrite      overwrite.Replacer
+	base64MinLength int
+	d              *detect.Detector
+	err            error
 }
 
 type Option func(*Opt)
@@ -35,6 +35,14 @@ type Option func(*Opt)
 func WithOverwrite(overwrite overwrite.Replacer) Option {
 	return func(o *Opt) {
 		o.overwrite = overwrite
+	}
+}
+
+// WithBase64MinLength sets the minimum length of base64-encoded strings to
+// check for secrets. Set to 0 to disable base64 detection.
+func WithBase64MinLength(n int) Option {
+	return func(o *Opt) {
+		o.base64MinLength = n
 	}
 }
 
@@ -72,25 +80,40 @@ func (o *Opt) Err() error {
 }
 
 // Redact removes secrets detected in the provided string.
+// If the content is a JSON document (object or array), string values
+// are individually unescaped, scanned for secrets, and re-escaped
+// to preserve valid JSON output.
 func (o *Opt) Redact(s string) (string, error) {
 	if o.err != nil {
 		return "", o.err
 	}
 
+	if isJSON([]byte(s)) {
+		return o.redactJSON(s)
+	}
+
+	return o.detectAndReplace(s)
+}
+
+// replacement represents a byte range in the original string to be
+// replaced with new text.
+type replacement struct {
+	start int
+	end   int
+	text  string
+}
+
+// detectReplacements returns the replacements for secrets detected in
+// the string without applying them.
+func (o *Opt) detectReplacements(s string) []replacement {
+	var replacements []replacement
+
+	// Gitleaks findings.
 	findings := o.d.DetectString(s)
 
 	fset := token.NewFileSet()
 	f := fset.AddFile("", -1, len(s))
 	f.SetLinesForContent([]byte(s))
-
-	// Reverse sort the findings (last line/col first): replacing
-	// a secret will not affect the offset of the next finding.
-	slices.SortFunc(findings, func(a, b report.Finding) int {
-		if n := cmp.Compare(b.StartLine, a.StartLine); n != 0 {
-			return n
-		}
-		return cmp.Compare(b.StartColumn, a.StartColumn)
-	})
 
 	// * token package
 	//
@@ -136,26 +159,118 @@ func (o *Opt) Redact(s string) (string, error) {
 		// Convert 1-based column offset to 0-based string offset accounting for newline.
 		off := f.Offset(pos) + (finding.StartColumn - nl)
 		off += strings.Index(finding.Match, finding.Secret)
-		s = s[:off] + o.overwrite.Replace(finding.Secret) + s[off+len(finding.Secret):]
+		replacements = append(replacements, replacement{
+			start: off,
+			end:   off + len(finding.Secret),
+			text:  o.overwrite.Replace(finding.Secret),
+		})
 	}
 
-	return s, nil
+	// Base64-encoded secrets.
+	for _, span := range o.detectBase64Secrets(s) {
+		replacements = append(replacements, replacement{
+			start: span.start,
+			end:   span.end,
+			text:  o.overwrite.Replace(s[span.start:span.end]),
+		})
+	}
+
+	return replacements
+}
+
+// applyReplacements deduplicates, sorts, and applies replacements to the string.
+func applyReplacements(s string, replacements []replacement) string {
+	replacements = deduplicateReplacements(replacements)
+
+	// Sort by start descending: replacing from back to front
+	// ensures earlier offsets remain valid.
+	slices.SortFunc(replacements, func(a, b replacement) int {
+		return cmp.Compare(b.start, a.start)
+	})
+
+	for _, r := range replacements {
+		s = s[:r.start] + r.text + s[r.end:]
+	}
+
+	return s
+}
+
+// detectAndReplace runs gitleaks detection on a string and replaces
+// any detected secrets using the configured overwrite strategy.
+func (o *Opt) detectAndReplace(s string) (string, error) {
+	return applyReplacements(s, o.detectReplacements(s)), nil
+}
+
+// deduplicateReplacements removes overlapping replacements by merging
+// overlapping spans, keeping the replacement text of the larger span.
+func deduplicateReplacements(reps []replacement) []replacement {
+	if len(reps) <= 1 {
+		return reps
+	}
+
+	slices.SortFunc(reps, func(a, b replacement) int {
+		return cmp.Compare(a.start, b.start)
+	})
+
+	var result []replacement
+	for _, r := range reps {
+		if len(result) > 0 {
+			last := &result[len(result)-1]
+			if r.start < last.end {
+				// Overlap: merge spans, keep the larger one's text.
+				rSpan := r.end - r.start
+				lastSpan := last.end - last.start
+				if r.end > last.end {
+					last.end = r.end
+				}
+				if rSpan > lastSpan {
+					last.text = r.text
+				}
+				continue
+			}
+		}
+		result = append(result, r)
+	}
+
+	return result
 }
 
 func newDetectorFromTOML(s string) (*detect.Detector, error) {
-	viper.SetConfigType("toml")
-	if err := viper.ReadConfig(strings.NewReader(s)); err != nil {
+	v := viper.New()
+	v.SetConfigType("toml")
+	if err := v.ReadConfig(strings.NewReader(s)); err != nil {
 		return nil, err
 	}
 
 	var vc config.ViperConfig
-	if err := viper.Unmarshal(&vc); err != nil {
+	if err := v.Unmarshal(&vc); err != nil {
 		return nil, err
 	}
+
+	// Handle the extend mechanism manually to avoid the gitleaks
+	// global extendDepth counter which silently stops working after
+	// 2 calls to Translate() with useDefault=true.
+	wantDefault := vc.Extend.UseDefault
+	vc.Extend.UseDefault = false
+	vc.Extend.Path = ""
 
 	cfg, err := vc.Translate()
 	if err != nil {
 		return nil, err
+	}
+
+	if wantDefault {
+		defaultCfg, err := translateTOML(config.DefaultConfig)
+		if err != nil {
+			return nil, err
+		}
+		for ruleID, rule := range defaultCfg.Rules {
+			if _, ok := cfg.Rules[ruleID]; !ok {
+				cfg.Rules[ruleID] = rule
+				cfg.Keywords = append(cfg.Keywords, rule.Keywords...)
+				cfg.OrderedRules = append(cfg.OrderedRules, ruleID)
+			}
+		}
 	}
 
 	// Overwrite the default private key rule with a regexp with non-greedy matching.
@@ -167,4 +282,24 @@ func newDetectorFromTOML(s string) (*detect.Detector, error) {
 	}
 
 	return detect.NewDetector(cfg), nil
+}
+
+// translateTOML parses a gitleaks TOML config string into a Config
+// without using the extend mechanism.
+func translateTOML(s string) (config.Config, error) {
+	v := viper.New()
+	v.SetConfigType("toml")
+	if err := v.ReadConfig(strings.NewReader(s)); err != nil {
+		return config.Config{}, err
+	}
+
+	var vc config.ViperConfig
+	if err := v.Unmarshal(&vc); err != nil {
+		return config.Config{}, err
+	}
+
+	vc.Extend.UseDefault = false
+	vc.Extend.Path = ""
+
+	return vc.Translate()
 }

@@ -64,12 +64,25 @@ func getenvbool(s string) bool {
 	return ok
 }
 
+func getenvint(s string, def int) int {
+	v, ok := os.LookupEnv(s)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 func main() {
 	envSkip := getenv("REDACT_SKIP", ".git .gitleaks.toml")
 	envRemove := getenv("REDACT_REMOVE", "redact")
 	envSubstitute := getenv("REDACT_SUBSTITUTE", redact.ReplacementText)
 	envRules := getenv("REDACT_RULES", "")
 	envLogLevel := getenv("REDACT_LOG_LEVEL", zerolog.LevelErrorValue)
+	envBase64MinLength := getenvint("REDACT_BASE64_MIN_LENGTH", 20)
 
 	envInPlace := getenvbool("REDACT_INPLACE")
 
@@ -80,6 +93,7 @@ func main() {
 	logLevel := flag.String("log-level", envLogLevel, "Set log level")
 	skip := flag.String("skip", envSkip, "Skip glob matches in directories")
 	flag.StringVar(skip, "S", envSkip, "Skip glob matches in directories")
+	base64MinLength := flag.Int("base64-min-length", envBase64MinLength, "Minimum base64 string length to check for secrets (0 to disable)")
 
 	inplace := flag.Bool("inplace", envInPlace, "Redact the file in-place")
 	flag.BoolVar(inplace, "i", envInPlace, "Redact the file in-place")
@@ -140,6 +154,7 @@ func main() {
 	red := redact.New(
 		redact.WithOverwrite(replace),
 		redact.WithRules(string(b)),
+		redact.WithBase64MinLength(*base64MinLength),
 	)
 
 	for _, v := range flag.Args() {
