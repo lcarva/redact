@@ -16,6 +16,7 @@ type secrets struct {
 }
 
 var testSecrets = []secrets{
+	{`token="abcdef1234567890abcdef"`, `token="**REDACTED**"`, `token="**********************"`},
 	{"$9$abc123", "$9$**REDACTED**", "$9$******"},
 	{"x$9$abc123\ndef456", "x$9$**REDACTED**\ndef456", "x$9$******\ndef456"},
 	{"x$9$abc123\ndef456\n$M$qwqe21034", "x$9$**REDACTED**\ndef456\n$M$**REDACTED**", "x$9$******\ndef456\n$M$*********"},
